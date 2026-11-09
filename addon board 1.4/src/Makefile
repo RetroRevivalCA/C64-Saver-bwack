@@ -1,3 +1,21 @@
+# ============================================================================
+# C64 Saver 2 firmware build
+#
+# REQUIREMENTS (the firmware depends on these; do not change them casually):
+#  - MCU = attiny85 and F_CPU = 8000000 (8 MHz). board.h stops the build with an
+#    #error if F_CPU is not 8000000UL, because every timing constant assumes 8 MHz.
+#  - The ATtiny85 fuses must be programmed for 8 MHz with CKDIV8 UNprogrammed
+#    (see AVRDUDE_WRITE_FUSES below). The firmware also checks this at start-up and
+#    halts with the relay open if CKDIV8 is still programmed. Brown-out detection at
+#    2.7 V (hfuse 0xdd) is also set there and recommended.
+#  - The size flags in the "Size optimisation" block below are REQUIRED. Without
+#    link-time optimisation and dead-code removal the program does not fit in the
+#    ATtiny85's 8 KB of flash. Flash used = text + data, RAM used = data + bss
+#    (see the size target); keep RAM use well under 512 bytes to leave stack room.
+#  - Built and bench-tested with the Microchip AVR8 GNU toolchain (avr-gcc 15.1).
+#    A different compiler version changes code size, so re-check the size output.
+# ============================================================================
+
 MCU = attiny85
 F_CPU = 8000000
 
@@ -41,7 +59,8 @@ DEPDIR = .dep
 
 
 # List C source files here. (C dependencies are automatically generated.)
-SRC = $(TARGET).c $(EXTLIBS) ina219.c main.c
+# UPDATED: Replaced redundant main.c with ui.c
+SRC = $(TARGET).c $(EXTLIBS) ina219.c ui.c
 
 
 # List C++ source files here. (C dependencies are automatically generated.)
@@ -49,7 +68,7 @@ CPPSRC =
 
 
 # List Assembler source files here.
-#     Make them always end in a capital .S.  Files ending in a lowercase .s
+#     Make them always end in a capital .S. Files ending in a lowercase .s
 #     will not be considered source files but generated files (assembler
 #     output from the compiler), and will be deleted upon "make clean"!
 #     Even though the DOS/Win* file system matches both .s and .S the same,
@@ -58,7 +77,7 @@ CPPSRC =
 ASRC =
 
 
-# Optimization level, can be [0, 1, 2, 3, s]. 
+# Optimization level, can be [0, 1, 2, 3, s].
 #     0 = turn off optimization. s = optimize for size.
 #     (Note: 3 is not always the best optimization level. See avr-libc FAQ.)
 OPT = s
@@ -116,12 +135,26 @@ CFLAGS += -fpack-struct
 CFLAGS += -fshort-enums
 CFLAGS += -Wall -Werror
 CFLAGS += -Wstrict-prototypes
+
+#---------------- Size optimisation (REQUIRED to fit in 8 KB flash) ----------------
+#  -flto:                link-time optimisation (inlines and removes dead code across files)
+#  -mcall-prologues:     share function prologue/epilogue code (smaller, slightly slower)
+#  -ffunction-sections,
+#  -fdata-sections:      put each function/variable in its own section so the linker's
+#                        --gc-sections (see LDFLAGS) can drop unused OLED library code
+CFLAGS += -flto
+CFLAGS += -mcall-prologues
+CFLAGS += -ffunction-sections
+CFLAGS += -fdata-sections
 #CFLAGS += -mshort-calls
 #CFLAGS += -fno-unit-at-a-time
 #CFLAGS += -Wundef
 #CFLAGS += -Wunreachable-code
 #CFLAGS += -Wsign-compare
-CFLAGS += -Wa,-adhlns=$(<:%.c=$(OBJDIR)/%.lst)
+# NOTE: the original "-Wa,-adhlns=..." assembler-listing flag is intentionally removed.
+# With -flto the assembler runs at link time rather than per source file, so a per-file
+# listing name no longer makes sense there (and CFLAGS is reused on the link line).
+# Use "make lss" (avr-objdump) to get a listing instead.
 CFLAGS += $(patsubst %,-I%,$(EXTRAINCDIRS))
 CFLAGS += $(CSTANDARD)
 
@@ -220,6 +253,7 @@ EXTMEMOPTS =
 #    -Map:      create map file
 #    --cref:    add cross reference to  map file
 LDFLAGS = -Wl,-Map=$(TARGET).map,--cref
+LDFLAGS += -Wl,--gc-sections
 LDFLAGS += $(EXTMEMOPTS)
 LDFLAGS += $(patsubst %,-L%,$(EXTRALIBDIRS))
 LDFLAGS += $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB)
@@ -230,10 +264,9 @@ LDFLAGS += $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB)
 #---------------- Programming Options (avrdude) ----------------
 
 # Programming hardware
-# Type: avrdude -c ?
-# to get a full listing.
+# Type: avrdude -c ? to get a full listing.
 #
-AVRDUDE_PROGRAMMER = usbasp
+AVRDUDE_PROGRAMMER = usbtiny
 
 # com1 = serial port. Use lpt1 to connect to parallel port.
 # AVRDUDE_PORT = com1    # programmer connected to serial device
@@ -244,8 +277,20 @@ AVRDUDE_WRITE_FLASH = -U flash:w:$(TARGET).hex:a
 
 #AVRDUDE_WRITE_EEPROM = -U eeprom:w:$(TARGET).eep
 
-# needed for 8 MHz, default from factory is 1 MHz
-AVRDUDE_WRITE_FUSES = -U lfuse:w:0xd2:m -U hfuse:w:0xdf:m -U efuse:w:0xff:m
+# Fuse settings (tested on hardware):
+#   lfuse 0xd2 = internal 8 MHz oscillator, CKDIV8 unprogrammed (factory default is 1 MHz)
+#   hfuse 0xdd = SPIEN only, plus brown-out detection at 2.7 V (BODLEVEL = 101).
+#                Resets the chip cleanly if its supply sags or is briefly interrupted.
+#                (0xdf = same but brown-out detection off.)
+#   efuse 0xff = defaults
+# WARNING: never write lfuse with a CKSEL value other than 0010 (internal 8 MHz): with no
+# crystal fitted the chip stops and cannot be programmed again over ISP.
+AVRDUDE_WRITE_FUSES = -U lfuse:w:0xd2:m -U hfuse:w:0xdd:m -U efuse:w:0xff:m
+
+# WARNING: writing flash performs a chip erase, which also wipes the EEPROM
+# (saved settings and calibration) because the EESAVE fuse is not programmed.
+# Read the EEPROM back first if you want to keep it:
+#   avrdude -p attiny85 -c usbtiny -P usb -B 5 -U eeprom:r:eeprom_backup.hex:i
 
 # Uncomment the following if you want avrdude's erase cycle counter.
 # Note that this counter needs to be initialized first using -Yn,
@@ -397,7 +442,10 @@ end:
 
 # Display size of file.
 HEXSIZE = $(SIZE) --target=$(FORMAT) $(TARGET).hex
-ELFSIZE = $(SIZE) --mcu=$(MCU) --format=avr $(TARGET).elf
+# The "--mcu" and "--format=avr" options only exist in some distributions' avr-size,
+# not in the Microchip toolchain, so use the portable default output instead.
+# Flash used = text + data (limit 8192). RAM used = data + bss (limit 512, keep stack room).
+ELFSIZE = $(SIZE) $(TARGET).elf
 
 sizebefore:
 	@echo
@@ -410,9 +458,13 @@ sizeafter:
 #	@if exist "$(TARGET).elf" echo $(MSG_SIZE_AFTER) && $(ELFSIZE)
 #	@if test -f $(TARGET).elf; then echo; echo $(MSG_SIZE_AFTER); $(ELFSIZE); \
 #	2>/dev/null; echo; fi
-#	$(ELFSIZE)
+	$(ELFSIZE)
 
 
+
+# Show the size of the build (flash = text + data, RAM = data + bss).
+size: $(TARGET).elf
+	$(ELFSIZE)
 
 # Display compiler version information.
 gccversion : 
@@ -420,7 +472,7 @@ gccversion :
 
 
 
-# Program the device.  
+# Program the device.
 install: $(TARGET).hex $(TARGET).eep
 	$(AVRDUDE) $(AVRDUDE_FLAGS) $(AVRDUDE_WRITE_FLASH) $(AVRDUDE_WRITE_EEPROM) $(AVRDUDE_WRITE_FUSES)
 
@@ -588,6 +640,6 @@ $(shell mkdir $(OBJDIR) 2>/dev/null)
 
 
 # Listing of phony targets.
-.PHONY : all begin finish end sizebefore sizeafter gccversion \
+.PHONY : all begin finish end sizebefore sizeafter size gccversion \
 build elf hex eep lss sym coff extcoff \
 clean clean_list program debug gdb-config

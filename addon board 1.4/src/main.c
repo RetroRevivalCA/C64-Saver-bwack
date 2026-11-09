@@ -1,547 +1,356 @@
 /**
- * SSD1306xLED - Library/Driver for the SSD1306 based OLED/PLED 128x64 displays
- *
- * @author Neven Boyanov
- *
- * This is part of the Tinusaur/SSD1306xLED project.
- *
- * Copyright (c) 2018 Neven Boyanov, The Tinusaur Team. All Rights Reserved.
- * Distributed as open source software under MIT License, see LICENSE.txt file.
- * Retain in your source code the link http://tinusaur.org to the Tinusaur project.
- *
- * Source code available at: https://bitbucket.org/tinusaur/ssd1306xled
- *
+ * @file main.c
+ * @brief Main Application Loop, Interrupts, and Hardware Protection Logic.
+ * @details Implements the core safety constraints, background ADC peak sampling,
+ * EEPROM state recovery, and relay triggering logic for the C64 Saver 2.
+ * 
+ * CHANGELOG:
+ * - 2026-11-07: FW_VERSION 1.00, first release of this fork. See CHANGES.md in this folder
+ *   for the full list of changes from the original firmware.
  */
 
-// ============================================================================
-// NOTE: About F_CPU - it should be set in either (1) Makefile; or (2) in the IDE.
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/eeprom.h>
+#include <avr/wdt.h>
+#include <avr/boot.h> // Software read of the fuse bytes (CKDIV8 guard)
+#include <avr/pgmspace.h> // PROGMEM for the fixed screen text
 #include <util/delay.h>
+#include <util/atomic.h>
 
-//#include "tinyavrlib/cpufreq.h"
-
+#include "board.h"
+#include "ui.h"
 #include "font8x16.h"
 #include "ssd1306xled.h"
-#include "num2str.h"
 #include "ina219.h"
 
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-//           ATtiny85
-//         +----------+
-//     (RST)---+ PB5  Vcc +---(+)--VCC--
-// ---[OWOWOD]---+ PB3  PB2 +---[TWI/SCL]-
-// --------------+ PB4  PB1 +-------------
-// ---GND--(-)---+ GND  PB0 +---[TWI/SDA]-
-//         +----------+
-//        Tinusaur Board
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Fixed screen text lives in flash, not RAM (16-character lines; ui_draw_str_P pads the rest).
+static const char txt_clock_err1[] PROGMEM = " CLOCK ERROR!";
+static const char txt_clock_err2[] PROGMEM = " CKDIV8 ACTIVE";
+static const char txt_splash1[]    PROGMEM = "   C64 Saver";
+static const char txt_splash2[]    PROGMEM = " Firmware v" FW_VERSION;
 
-// ----------------------------------------------------------------------------
+/** @brief Bit position of CKDIV8 in the ATtiny85 low fuse byte (0 = programmed = clock divided by 8). */
+#define LFUSE_CKDIV8_BIT 7
 
-//#define F_CPU 8000000UL    // 8 MHz
-
-#define SSD1306_SCL   PB2
-#define SSD1306_SDA   PB0
-#define HOLD_N        PB1
-
-#define HOLD_ON       PORTB |= (1 << HOLD_N)
-#define HOLD_OFF      PORTB &= ~(1 << HOLD_N)
-
-#define SSD1306_SA    0x78  // Slave address
-
-#define INA219_SA    0b1000000 // Slave address
-
-// ----------------------------------------------------------------------------
-
-#define STEPS_DELAY_SHORT 200
-#define STEPS_DELAY 600
-#define STEPS_DELAY_LONG 1000
-
-enum { MEASURE_VAC=0, MEASURE_ACCUR=1, WRITE_VDC=2, WRITE_DCCUR=3 };
-uint8_t state = 0;
-
-struct config {
-  uint8_t oc; // in amps*10
-  uint8_t hold;
-  uint8_t vtrip;
-};
+// System Configuration state variables
 struct config conf;
 
-uint8_t overcurrent_flag = 0;
-uint8_t overvoltage_flag = 0;
-
+// EEPROM Allocations
 uint8_t EEMEM EEOvercurrent;
 uint8_t EEMEM EEHold;
 uint8_t EEMEM EEVtrip;
+uint8_t EEMEM EEUVtrip; 
+uint16_t EEMEM EECalibration; 
+uint16_t EEMEM EEACCalibration; 
+uint8_t EEMEM EEScreensaver;
 
-void init(void) {
-  conf.oc=12; // 1.2A
-  conf.hold=1; // 1=hold, 0=autorecover
-  conf.vtrip=55; // 5.5V
+// Fault tracking and sensor data struct allocations
+fault_status_t system_faults = {0}; 
+uint16_t recorded_overcurrent = 0;
+volatile isr_data_t sensor_data = {0, 0, false};
+bool sensor_valid = false; // See board.h: result of the latest INA219 validation
 
-  uint8_t ee_oc=255, ee_hold=255, ee_vtrip=255;
-  ee_oc = eeprom_read_byte(&EEOvercurrent);
-  ee_hold = eeprom_read_byte(&EEHold);
-  ee_vtrip = eeprom_read_byte(&EEVtrip);
-  if (ee_oc<255) conf.oc = ee_oc;
-  if (ee_hold<255) conf.hold = ee_hold;
-  if (ee_vtrip<255) conf.vtrip = ee_vtrip;
-  
-  // disable interrupts
-  GIMSK = PCMSK = USICR = USISR = 0;
-  cli();
-  // enable global pullups
-  MCUCR &= ~(1 << PUD);
+/**
+ * @brief ADC Interrupt Service Routine.
+ * @details Fires continuously to read analog channels. Samples peak-to-peak 
+ * AC voltage and current by tracking highs and lows over 200 samples. 
+ * Also detects UI push-button states.
+ */
+ISR(ADC_vect) {
+    static uint16_t sample_count = 0;
+    static uint16_t adchigh = 0x0000, adclow = 0xFFFF;
+    static uint8_t discard_count = 0; 
+    static int32_t acc_sum = 0;   // Sum of (sample - 512) for the AC current channel
+    static uint32_t acc_sq = 0;   // Sum of squares of (sample - 512)
+    static uint16_t vac_f = 0;    // AC voltage peak-to-peak, smoothed: holds 8x the running average
 
-  // set SDA and SCL to tri-state
-  DDRB &= ~((1 << PB0) | (1 << PB2));
-  PORTB &= ~((1 << PB0) | (1 << PB2));
+    uint16_t adc_val = ADC; 
+    uint8_t current_channel = ADMUX & 0x0F;
 
-  // wait a bit until everything stabilises
-  _delay_ms(40);
+    if (discard_count > 0) {
+        discard_count--; // Discard samples immediately following channel switch
+    } else {
+        // The push-button shares the VAC sense pin: a reading below 100 counts as "pressed".
+        // Limitation: an AC sag or a shorted sense line is indistinguishable from a press.
+        // The UI therefore requires a sustained hold, a minimum latch time and a valid
+        // sensor before it will clear a latched fault (see handle_ui_update()).
+        if (current_channel == ADC_CH_VAC && adc_val < 100) {
+            sensor_data.button_down = true;
+        } else {
+            if (current_channel == ADC_CH_VAC) sensor_data.button_down = false;
+            
+            // Track waveform peak-to-peak
+            if (adc_val > adchigh) adchigh = adc_val;
+            if (adc_val < adclow)  adclow = adc_val;
 
-  ssd1306xled_font8x16 = ssd1306xled_font8x16data;
-  ssd1306_init();
-
-  initINA();
-
-  DDRB |= (1 << HOLD_N); 
-  HOLD_OFF;
-}
-
-void formatNumber(uint16_t value, char *buf, uint8_t maxlen, uint8_t decimals, uint8_t decimalpoint, char* unit) {
-  memset(buf,0,maxlen);
-  uint8_t offset=0;
-  if (maxlen < 5+1+strlen(unit)+1) return; // 5 digits + 1 dot + string length of unit + zero terminator
-  if (decimals>5) return;
-  snprintf(buf,maxlen,"%5d",value);
-  //printf("-%s-\n", buf);
-  
-  // align field by number of decimal  12.345uu
-  offset = 5-decimals;
-  int i;
-  for(i=0; i<(decimals); i++)
-    buf[i]=buf[i+offset];
-  buf[decimals]=0;    
-  //printf("-%s-\n", buf);
-
-  // pad leading zeroes
-  for(int i=0; i<decimals; i++) {
-    if(buf[i]==' ' && i>=(decimals-decimalpoint-1)) buf[i]='0';
-  }
-  //printf("-%s-\n", buf);
-
-  // add the dot
-  if(decimalpoint>0) {
-    for(int i=decimals; i>=decimals-decimalpoint; i--)   
-      buf[i+1]=buf[i]; // move to right for dot
-    buf[decimals-decimalpoint]='.';
-  }
-  //printf("-%s-\n", buf);
-  
-  // add unit
-  char* ptr = buf + decimals+1; // decimals + dot
-  snprintf(ptr, maxlen-5, "%s", unit);
-}
-
-void adc_setup(uint8_t channel) {
-  ADMUX = (1<<ADLAR) | channel; // SENSE_VAC
-  //ADMUX = (1<<ADLAR) | (1<<MUX1) | (1<<MUX0); // SENSE_ACCUR
-  //ADMUX = (1<<REFS1)|(1<<ADLAR)|(1<<REFS2)|(1<<MUX1);
-}
-
-uint16_t read_adc(void) {
-  ADCSRA = (1<<ADEN) | (1<<ADSC) | (1<<ADPS1) | (1<<ADPS0); // conversion start
-  while(ADCSRA & (1<<ADSC)); // wait for conversion
-  uint8_t adl = ADCL;
-  uint8_t adh = ADCH;
-  return (adh<<2) | (adl>>6);
-}
-
-uint16_t read_adc_vac(int *buttondown) {
-  static uint16_t adc_present_value;
-  static uint16_t i=0;
-  static uint16_t adchigh=0x0000, adclow=0xffff;
-  uint16_t adcval = read_adc();
-  if (adcval<100) {
-    *buttondown=1;
-    return adc_present_value;
-  }
-  *buttondown=0;
-  i++;
-  if (i>3000) {
-    adc_present_value = adchigh-adclow;
-    i=0;
-    adchigh=0;
-    adclow=0xffff;
-  } else {
-    if(adcval>adchigh) adchigh=adcval;
-    if(adcval<adclow) adclow=adcval;
-  }
-  return adc_present_value;
-}
-
-uint16_t read_adc_accur(void) {
-  static uint16_t adc_present_value;
-  static uint16_t i=0;
-  static uint16_t adchigh=0x0000, adclow=0xffff;
-  uint16_t adcval = read_adc();
-  i++;
-  if (i>3000) {
-    adc_present_value = adchigh-adclow;
-    i=0;
-    adchigh=0;
-    adclow=0xffff;
-  } else {
-    if(adcval>adchigh) adchigh=adcval;
-    if(adcval<adclow) adclow=adcval;
-  }
-  return adc_present_value;
-}
-
-void setup_timer1(uint8_t delay) {
-  TCCR1 = (0b1110<<CS10);
-  OCR1A = delay;	
-  TCNT1 = 0;
-  TIFR |= (1<<OCF1A);
-}
-
-uint8_t has_timed_out(void) {
-  return ((TIFR & (1<<OCF1A))>0)  ? 1 : 0;
-
-}
-
-void reset_timer1(void) {
-    TIFR |= (1<<OCF1A);
-    TCNT1 = 0;		
-}
-
-enum buttonpress {BUTTON_IDLE=0, BUTTON_SHORT_PRESS=1, BUTTON_LONG_PRESS=2};
-
-uint8_t read_button(uint8_t buttondown) {
-  static uint8_t cnt = 0;
-  static uint8_t longpress=0;
-  if (buttondown && longpress) return BUTTON_IDLE;
-  longpress=0;
-  if (buttondown) {
-    cnt++;
-    if (cnt>10) {
-      cnt=0;
-      longpress=1; // remember it
-      return BUTTON_LONG_PRESS;
-    }
-  }
-  else {
-    if(cnt>1) {
-      cnt=0;
-      return BUTTON_SHORT_PRESS;
-    }
-    cnt=0;
-  }
-  return BUTTON_IDLE;
-}
-
-uint16_t recorded_overcurrent=0;
-
-void main_screen(uint16_t adc_vac, uint16_t adc_accur, uint16_t busvoltage, uint16_t current, int _button) {
-  char buf[8];
-
-  const int decimals=5, decimalpoint=3;
-  if (state==MEASURE_VAC) {
-    formatNumber(adc_vac*19/100+adc_vac*2/100, buf, sizeof(buf), 3, 1, "V"); 
-    //formatNumber(recorded_overcurrent, buf, sizeof(buf), 5, 3, "A"); 
-    ssd1306_string_font8x16xy(0,0,buf);
-  }
-  else if (state==MEASURE_ACCUR) {
-    formatNumber(adc_accur, buf, sizeof(buf), 4, 0, "A"); 
-    ssd1306_string_font8x16xy(0,2,buf);
-  }
-  else if (state==WRITE_VDC) {
-    formatNumber(busvoltage, buf, sizeof(buf), decimals, decimalpoint, "V"); 
-    if (overvoltage_flag|| busvoltage>5500) {
-      static uint8_t flash=0;
-      flash++;
-      if (flash>21) strcpy(buf,"       ");
-      if (flash>25) flash=0;
-    }
-    ssd1306_string_font8x16xy(7*10,2,buf);
-  }
-  else if (state==WRITE_DCCUR) {
-    formatNumber(current, buf, sizeof(buf), decimals, decimalpoint, "A"); 
-    if (overcurrent_flag) {
-      static uint8_t flash=0;
-      flash++;
-      formatNumber(recorded_overcurrent, buf, sizeof(buf), decimals, decimalpoint, "A"); 
-      if (flash>21) strcpy(buf,"       ");
-      if (flash>25) flash=0;
-    }
-    else 
-      formatNumber(current, buf, sizeof(buf), decimals, decimalpoint, "A"); 
-    ssd1306_string_font8x16xy(7*10,0,buf);
-  }  
-}
-
-void overcurrent_screen(void) {
-  char buf[8];
-  if (state==MEASURE_VAC) {
-    ssd1306_string_font8x16xy(0,0,"Overcurrent");
-    formatNumber(conf.oc, buf, sizeof(buf), 2, 1, "A"); 
-    ssd1306_string_font8x16xy(8*3,2,buf);
-    ssd1306_string_font8x16xy(8*6,2,"A");
-  }
-}
-
-uint8_t oc_temp=0;
-
-void set_overcurrent_screen(uint8_t button) {
-  if (button==BUTTON_LONG_PRESS) oc_temp = conf.oc;
-  if (button==BUTTON_SHORT_PRESS) {
-    oc_temp += 1; // +0.1A
-    if (oc_temp>20) oc_temp=5;
-  }
-  if (state==WRITE_DCCUR)
-    ssd1306_string_font8x16xy(8*3,2,"    ");
-  else if (state==MEASURE_VAC) {
-    char buf[8];
-    formatNumber(oc_temp, buf, sizeof(buf), 2, 1, "A"); 
-    ssd1306_string_font8x16xy(8*3,2,buf);
-  }
-    
-}
-
-void overvoltage_hold_screen(void) {
-  ssd1306_string_font8x16xy(0,0,"Overvoltage Hold");
-  if (conf.hold)
-    ssd1306_string_font8x16xy(8*3,2,"HOLD       ");
-  else
-    ssd1306_string_font8x16xy(8*3,2,"AUTORECOVER");
-}
-
-uint8_t hold_temp = 0;
-
-void set_overvoltage_hold_screen(uint8_t button) {
-  if (button==BUTTON_LONG_PRESS) hold_temp = conf.hold;
-  if (button==BUTTON_SHORT_PRESS) {
-    hold_temp += 1;
-    if (hold_temp>1) hold_temp=0;
-  }
-  if (state!=WRITE_DCCUR) {
-    if (hold_temp)
-      ssd1306_string_font8x16xy(8*3,2,"HOLD       ");
-    else
-      ssd1306_string_font8x16xy(8*3,2,"AUTORECOVER");
-  }
-  else
-    ssd1306_string_font8x16xy(8*3,2,"           ");
-}
-
-void dc_volt_trippoint_screen(void) {
-  char buf[8];
-  ssd1306_string_font8x16xy(0,0,"Voltage Trippnt.");
-  if (conf.vtrip==55)
-    ssd1306_string_font8x16xy(8*2,2,"5.5V Hardware");
-  else {
-    formatNumber(conf.vtrip, buf, sizeof(buf), 2, 1, "V"); 
-    ssd1306_string_font8x16xy(8*2,2,buf);
-    ssd1306_string_font8x16xy(8*7,2,"Software");
-  }
-}
-
-uint8_t ov_temp=0;
-
-void set_dc_volt_trippoint_screen(uint8_t button) {
-  char buf[8];
-  if (button==BUTTON_LONG_PRESS) ov_temp = conf.vtrip;
-  if (button==BUTTON_SHORT_PRESS) {
-    ov_temp += 1; // +0.1V
-    if (ov_temp>55) ov_temp=51;
-  }
-  if (state==MEASURE_VAC) {
-    if (ov_temp==55)
-      ssd1306_string_font8x16xy(8*2,2,"5.5V Hardware");
-    else {
-      formatNumber(ov_temp, buf, sizeof(buf), 2, 1, "V"); 
-      ssd1306_string_font8x16xy(8*2,2,buf);
-      ssd1306_string_font8x16xy(8*7,2,"Software");
-    }
-  }
-  else if (state==WRITE_DCCUR)
-    ssd1306_string_font8x16xy(8*2,2,"    ");
-}
-
-
-enum { MENUSCREEN=0, RECOVER,
-DC_OVERCCURRENT,   SET_DC_OVERCURRENT,   STORE_DC_OVERCURRENT,
-OVERVOLTAGE_HOLD,  SET_OVERVOLTAGE_HOLD, STORE_OVERVOLTAGE_HOLD,
-DC_VOLT_TRIPPOINT, SET_DC_VOLT_TRIPPOINT, STORE_DC_VOLT_TRIPPOINT };
-
-uint8_t next_screen_state(uint8_t presentstate, uint8_t button) {
-  uint8_t nextstate=presentstate;
-  switch(presentstate) {
-    case MENUSCREEN:
-      if (button==BUTTON_SHORT_PRESS) nextstate = DC_OVERCCURRENT;
-      else if (button==BUTTON_LONG_PRESS) nextstate = RECOVER;
-      break;
-    case DC_OVERCCURRENT:
-      if (button==BUTTON_SHORT_PRESS) nextstate = OVERVOLTAGE_HOLD;
-      else if (button==BUTTON_LONG_PRESS) nextstate = SET_DC_OVERCURRENT;
-      break;
-    case OVERVOLTAGE_HOLD:
-      if (button==BUTTON_SHORT_PRESS) nextstate = DC_VOLT_TRIPPOINT;
-      else if (button==BUTTON_LONG_PRESS) nextstate = SET_OVERVOLTAGE_HOLD;
-      break;
-    case DC_VOLT_TRIPPOINT:
-      if (button==BUTTON_SHORT_PRESS) nextstate = MENUSCREEN;
-      else if (button==BUTTON_LONG_PRESS) nextstate = SET_DC_VOLT_TRIPPOINT;
-      break;
-      
-    case SET_DC_OVERCURRENT:
-      if (button==BUTTON_LONG_PRESS) nextstate = STORE_DC_OVERCURRENT;
-      break;
-    case SET_OVERVOLTAGE_HOLD:
-      if (button==BUTTON_LONG_PRESS) nextstate = STORE_OVERVOLTAGE_HOLD;
-      break;
-    case SET_DC_VOLT_TRIPPOINT:
-      if (button==BUTTON_LONG_PRESS) nextstate = STORE_DC_VOLT_TRIPPOINT;
-      break;
-      
-    case STORE_DC_OVERCURRENT:
-      nextstate = DC_OVERCCURRENT;
-      break;
-    case STORE_OVERVOLTAGE_HOLD:
-      nextstate = OVERVOLTAGE_HOLD;
-      break;
-    case STORE_DC_VOLT_TRIPPOINT:
-      nextstate = DC_VOLT_TRIPPOINT;
-      break;
-
-    case RECOVER:
-      nextstate = MENUSCREEN;
-      break;
-
-    default:
-      break;
-  }
-  return nextstate;
-}
-
-int main(void) {
-//  int count = 0;
-  init();
-  ssd1306_clear();
-
-  I2C_reset();
-  _delay_ms(50); // ms loop
-  setup_timer1(10);
-  adc_setup(2);
-  static int buttondown=0;
-  uint16_t adc_vac=0,adc_accur=0;
-  uint8_t button = BUTTON_IDLE;
-  uint8_t present_screen_state=MENUSCREEN;
-  uint16_t dcvoltage = 0;
-  uint16_t dccurrent = 0;
-  _delay_ms(100);
-
-  while (1) {
-    //uint16_t configval, shuntvoltage;
-    //const int reg_addr_config = 0;
-    //const int shunt_voltage_reg = 1;
-    //const int bus_voltage_reg = 2;
-    //const int power_reg = 3;
-    //const int current_reg = 4;
-    //const int calibration_reg = 5;
-
-    if (state==MEASURE_VAC || state==WRITE_VDC) {
-      buttondown=0;
-      adc_vac = read_adc_vac(&buttondown);
-  
-    } else if (state==MEASURE_ACCUR || state==WRITE_DCCUR) {
-      adc_accur = read_adc_accur();
-    }
-    if ( has_timed_out() ) {
-      reset_timer1();
-     //HOLD_ON;
-      //read_register(reg_addr_config, &configval);
-      //read_register(shunt_voltage_reg, &shuntvoltage);
-      //adc_setup(2);
-      //adc_vac = read_adc_vac(&buttondown);
-
-      if (state==MEASURE_VAC) {
-        button = read_button(buttondown);
-        uint8_t old_state = present_screen_state;
-        present_screen_state = next_screen_state(present_screen_state, button);
-        if(old_state != present_screen_state) ssd1306_clear();
-      }
-
-      if (overcurrent_flag && !overvoltage_flag) {
-        static uint16_t cnt=0;
-        cnt++;
-        if (cnt>500) {
-          cnt=0;
-          overcurrent_flag=0;
-          HOLD_OFF;
-          _delay_ms(20);
+            if (current_channel != ADC_CH_VAC) {
+                // True RMS needs every sample, not just the extremes. Centre on mid-scale (512)
+                // so the sums stay small: 256 samples of at most 512 squared fit in 32 bits.
+                int16_t d = (int16_t)adc_val - 512;
+                acc_sum += d;
+                acc_sq  += (uint32_t)((int32_t)d * d);
+            }
         }
-      }
-      dcvoltage = ina219_get_bus_voltage_mv();
-      dccurrent = ina219_get_current_ma();
-      if (overvoltage_flag && dcvoltage < (conf.vtrip*100)-100 && !conf.hold) {
-        present_screen_state = RECOVER;
-      }
 
-      // handle limits
-
-      if (dccurrent > conf.oc*100 && !overcurrent_flag) {
-        recorded_overcurrent = dccurrent;
-        overcurrent_flag = 1;
-      }
-      
-//      if (conf.vtrip < 55 && dcvoltage >= conf.vtrip*100 && !overvoltage_flag) {
-      if (dcvoltage >= conf.vtrip*100 && !overvoltage_flag) {
-        overvoltage_flag = 1;
-      }
-      
-      switch(present_screen_state) {
-        case MENUSCREEN:            main_screen(adc_vac,adc_accur,dcvoltage,dccurrent,button); break;
-        case DC_OVERCCURRENT:       overcurrent_screen(); break;
-        case OVERVOLTAGE_HOLD:      overvoltage_hold_screen(); break;
-        case DC_VOLT_TRIPPOINT:     dc_volt_trippoint_screen(); break;
-        
-        case SET_DC_OVERCURRENT:    set_overcurrent_screen(button); break;
-        case SET_OVERVOLTAGE_HOLD:  set_overvoltage_hold_screen(button); break;
-        case SET_DC_VOLT_TRIPPOINT: set_dc_volt_trippoint_screen(button); break;
-        
-        case STORE_DC_OVERCURRENT:
-          conf.oc = oc_temp; eeprom_write_byte(&EEOvercurrent, conf.oc); break;
-        case STORE_OVERVOLTAGE_HOLD:
-          conf.hold = hold_temp; eeprom_write_byte(&EEHold, conf.hold); break;
-        case STORE_DC_VOLT_TRIPPOINT:
-          conf.vtrip = ov_temp; eeprom_write_byte(&EEVtrip, conf.vtrip); break;
-        case RECOVER:
-          HOLD_OFF; overcurrent_flag=0; overvoltage_flag=0; break;
-      }
-
-      if (overcurrent_flag || overvoltage_flag) HOLD_ON;
-      else HOLD_OFF;
-      
-      // next state
-      state++;
-      state = state & 0x03;
-      if (state==MEASURE_VAC || state == WRITE_VDC) {
-        adc_setup(2);
-      } else if (state==MEASURE_ACCUR || state == WRITE_DCCUR){
-        adc_setup(3);
-      }
-      button = BUTTON_IDLE;
-      //HOLD_OFF;
+        // Calculate peak envelope after 200 samples, then swap channels
+        // The current channel uses 256 samples (a power of two, so the maths is shifts only)
+        if (++sample_count > (current_channel == ADC_CH_VAC ? 200 : 255)) {
+            if (current_channel == ADC_CH_VAC) {
+                // Smooth the reading (f = f - f/8 + new) so the display does not jump with every
+                // window. Seeded on the first window so it does not creep up from 0 at power-up.
+                uint16_t pp = adchigh - adclow;
+                if (vac_f == 0) vac_f = pp << 3;
+                vac_f = vac_f - (vac_f >> 3) + pp;
+                sensor_data.vac_peak = vac_f >> 3;
+                adc_select_channel_accur();
+            } else {
+                // Variance = mean(d^2) - mean(d)^2. The mean is kept in quarter-counts
+                // (sum >> 6) so truncating it costs little accuracy.
+                int16_t m4 = (int16_t)(acc_sum >> 6);
+                int32_t v = (int32_t)(acc_sq >> 8) - (((int32_t)m4 * m4) >> 4);
+                if (v < 0) v = 0;
+                if (v > 65535) v = 65535;
+                sensor_data.accur_var = (uint16_t)v;
+                adc_select_channel_vac();
+            }
+            sample_count = 0;
+            acc_sum = 0;
+            acc_sq = 0;
+            adchigh = 0;
+            adclow = 0xFFFF;
+            discard_count = 10; 
+        }
     }
-  }
-  return 0;
+    
+    // Start next conversion
+    ADCSRA |= (1 << ADSC); 
 }
 
-// ============================================================================
+/**
+ * @brief Master system initialization sequence.
+ * @details Loads user configurations from EEPROM, sanitizes variables within safe bounds,
+ * initiates I2C communications, pre-sets timers, and enables the watchdog.
+ */
+void init(void) {
+    // 1. Read stored settings from EEPROM
+    uint8_t ee_oc = eeprom_read_byte(&EEOvercurrent);
+    uint8_t ee_hold = eeprom_read_byte(&EEHold);
+    uint8_t ee_vtrip = eeprom_read_byte(&EEVtrip);
+    uint8_t ee_uvtrip = eeprom_read_byte(&EEUVtrip);
+    uint16_t ee_cal = eeprom_read_word(&EECalibration); 
+    uint16_t ee_ac_cal = eeprom_read_word(&EEACCalibration); 
+    
+    // 2. Bound-check constraints to prevent erratic behavior from corrupt memory
+    conf.oc =     (ee_oc >= LIMIT_OC_MIN && ee_oc <= LIMIT_OC_MAX) ? ee_oc : LIMIT_OC_DEFAULT; 
+    conf.hold =   (ee_hold <= 1) ? ee_hold : 1;  
+    conf.vtrip =  (ee_vtrip >= LIMIT_OV_MIN && ee_vtrip <= LIMIT_OV_MAX) ? ee_vtrip : LIMIT_OV_DEFAULT; 
+    conf.uvtrip = (ee_uvtrip >= LIMIT_UV_MIN && ee_uvtrip <= LIMIT_UV_MAX) ? ee_uvtrip : LIMIT_UV_DEFAULT;
+    conf.cal =    (ee_cal >= LIMIT_CAL_MIN && ee_cal <= LIMIT_CAL_MAX) ? ee_cal : LIMIT_CAL_DEFAULT;
+    conf.ac_cal = (ee_ac_cal >= LIMIT_AC_CAL_MIN && ee_ac_cal <= LIMIT_AC_CAL_MAX) ? ee_ac_cal : LIMIT_AC_CAL_DEFAULT;
+
+    // The INA219 calibration register ignores bit 0. Force an even value so the runtime
+    // read-back comparison can never mismatch because of a corrupt-but-in-range odd EEPROM value.
+    conf.cal &= INA219_CAL_REG_MASK;
+  
+    cli(); // Disable interrupts during hard setup
+    
+    // 3. Hardware pin states setup
+    MCUCR &= ~(1 << PUD); // Global pull-up enable
+    DDRB &= ~((1 << PB0) | (1 << PB2));
+    PORTB &= ~((1 << PB0) | (1 << PB2));
+    
+    _delay_ms(40); // Boot stabilization delay
+
+    // 4. Peripherals setup
+    ssd1306xled_font8x16 = ssd1306xled_font8x16data;
+    ssd1306_init();
+    
+    // Drive the relay pin to its DISCONNECT level (PORTB high) BEFORE making it an output.
+    // Making it an output first would drive the reset-default low level, i.e. CONNECT.
+    // init() never connects the relay: the main loop does that after the first valid sensor read.
+    RELAY_DISCONNECT(); 
+    DDRB |= (1 << HOLD_N);
+    
+    initINA(conf.cal); 
+
+    // 5. Timer setup (Used for UI rendering frequency)
+    TCCR1 = (0b1110 << CS10);
+    OCR1A = 10;	
+    TCNT1 = 0;
+    TIFR |= (1 << OCF1A);
+
+    // 6. ADC setup
+    ADMUX = ADC_CH_VAC;
+    ADCSRA = (1 << ADEN) | (1 << ADIE) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+    ADCSRA |= (1 << ADSC); 
+
+    wdt_enable(WDTO_250MS); // Enable Watchdog timer (250ms timeout)
+    sei(); // Enable global interrupts
+}
+
+/**
+ * @brief Halts the system, with the relay open, if the CKDIV8 fuse is programmed.
+ * @details With CKDIV8 programmed the CPU runs at 1 MHz instead of 8 MHz, which makes every
+ * timing constant 8x too slow (including the overcurrent debounce and bit-banged I2C).
+ * Must be called first in main(), while the watchdog is disabled (so the halt loop cannot
+ * trigger a reset loop). The relay is opened BEFORE anything else so a bad clock can never
+ * leave power connected.
+ * @note Verify on real hardware that the fuse read behaves as expected on the ATtiny85.
+ */
+static void clock_fuse_guard(void) {
+    RELAY_DISCONNECT();            // Level first, then direction (see init())
+    DDRB |= (1 << HOLD_N);
+
+    uint8_t low_fuse = boot_lock_fuse_bits_get(GET_LOW_FUSE_BITS);
+    if (low_fuse & (1 << LFUSE_CKDIV8_BIT)) {
+        return;                    // Bit set = CKDIV8 unprogrammed = full-speed clock: OK
+    }
+
+    // Best-effort on-screen message. The relay is already open, so a failure to draw is harmless.
+    DDRB &= ~((1 << PB0) | (1 << PB2));
+    PORTB &= ~((1 << PB0) | (1 << PB2));
+    _delay_ms(40);
+    ssd1306xled_font8x16 = ssd1306xled_font8x16data;
+    ssd1306_init();
+    ssd1306_clear();
+    ui_draw_str_P(0, 0, txt_clock_err1, 16);
+    ui_draw_str_P(0, 2, txt_clock_err2, 16);
+
+    for (;;) { }                   // Halt. Power-cycle after reprogramming the fuses.
+}
+
+/**
+ * @brief Non-blocking UI timer check.
+ * @return True if a UI rendering tick has elapsed, false otherwise.
+ */
+bool ui_timer_tick(void) {
+    if ((TIFR & (1 << OCF1A)) != 0) {
+        TIFR |= (1 << OCF1A); 
+        TCNT1 = 0; 
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Application Main Loop.
+ * @details Executes continuous DC safety checks, updates UI state machines, and resets WDT.
+ */
+int main(void) {
+    // Clear WDRF immediately: while it is set the watchdog is forced on at its shortest
+    // timeout, which would reset the chip again during init() (boot loop).
+    MCUSR = 0;
+    wdt_disable();
+
+    // Must run before anything that can connect the relay or arm the watchdog.
+    clock_fuse_guard();
+
+    I2C_reset(); // Force clear bus in case of static shock on reboot
+    init();
+    ssd1306_clear();
+    _delay_ms(50);
+    wdt_reset(); 
+    
+    // Draw initial splash screen
+    ui_draw_str_P(0, 0, txt_splash1, 16);
+    ui_draw_str_P(0, 2, txt_splash2, 16);
+    
+    // System timers and state trackers
+    uint16_t splash_timer = 0; 
+    uint16_t dcvoltage = 0;
+    uint16_t dccurrent = 0;
+    
+    uint8_t dc_oc_counter = 0;
+    uint8_t dc_ov_counter = 0; // Consecutive over-voltage readings
+    uint8_t i2c_err_counter = 0; 
+    bool link_established = false; // Set after the first valid INA219 read; relay stays open until then
+    bool dc_oc_active = false;
+
+    while (1) {
+        wdt_reset(); // Feed watchdog
+
+        // Run non-blocking UI and Sensor update sequence (one tick, nominally ~11 ms)
+        if (ui_timer_tick()) {
+            
+            // Read sensors
+            dcvoltage = ina219_get_bus_voltage_mv();
+            int16_t raw_current = ina219_get_current_ma();
+            uint16_t active_cal = ina219_get_calibration();
+
+            // Validate the sensor. A read is bad if the bus is dead (0xFFFF) or the INA219 has
+            // silently reset (calibration reverted, so current would read 0 mA while voltage
+            // still looks fine). A stuck-low SDA returns 0x0000 for the calibration register,
+            // which also fails the comparison. Bit 0 of the register is void, hence the mask.
+            const uint16_t expected_cal = conf.cal & INA219_CAL_REG_MASK;
+            sensor_valid = (dcvoltage != 0xFFFF) && (active_cal == expected_cal);
+
+            if (!sensor_valid) {
+                if (i2c_err_counter < 255) i2c_err_counter++; // Saturate instead of wrapping
+                if (i2c_err_counter > 50) { // 500 ms grace period for sensor boot/recovery
+                    system_faults.flags.sensor = 1; // Latch: protection is blind without the sensor
+                }
+                I2C_reset();
+                wdt_reset(); 
+                initINA(conf.cal); // Also restores calibration after a sensor reset
+                dcvoltage = 0; // Mask invalid readings
+                dccurrent = 0;
+            } else {
+                i2c_err_counter = 0;
+                link_established = true;
+                // Clamp negative zero-load calibration flutter to 0 mA to prevent wrap-around overcurrent faults
+                dccurrent = (raw_current < 0) ? 0 : (uint16_t)raw_current;
+            }
+
+            // Flag overcurrent threshold exceed
+            dc_oc_active = (dccurrent > (conf.oc * 100));
+
+            // Flag overvoltage limit exceed
+            // It must be seen on OV_CONFIRM_TICKS consecutive ticks (3 ticks, about 34 ms), so the
+            // sub-millisecond spike from switching the C64 off does not latch a fault.
+            if (dcvoltage >= (conf.vtrip * 100)) {
+                if (dc_ov_counter < OV_CONFIRM_TICKS) dc_ov_counter++;
+            } else {
+                dc_ov_counter = 0;
+            }
+            if (dc_ov_counter >= OV_CONFIRM_TICKS && !system_faults.flags.overvoltage) {
+                system_faults.flags.overvoltage = 1;
+            }
+
+            // Debounce overcurrent trips (condition must persist for 30 ticks, about 340 ms at ~11 ms per tick)
+            if (dc_oc_active) {
+                if (dc_oc_counter < 30) dc_oc_counter++; 
+            } else {
+                // Decay gradually, and hold on masked reads, so a single I2C glitch cannot reset the debounce
+                if (dc_oc_counter > 0 && i2c_err_counter == 0) dc_oc_counter--; 
+            }
+
+            // Commit overcurrent trip if debounce passes
+            if (dc_oc_counter >= 30 && !system_faults.flags.overcurrent) {
+                recorded_overcurrent = dccurrent; // Save value that caused the trip
+                system_faults.flags.overcurrent = 1;
+            }
+
+            // The main tick is the ONLY place that drives the relay. It runs before the slow
+            // bit-banged OLED redraw so a fault opens the relay without waiting on the UI.
+            // The relay also stays open until the sensor has been read successfully once.
+            if (system_faults.all != 0 || !link_established) { 
+                RELAY_DISCONNECT(); 
+            } else { 
+                RELAY_CONNECT(); 
+            }
+
+            // Splash screen clear logic
+            if (splash_timer < 266) { 
+                splash_timer++;
+                if (splash_timer == 266) {
+                    ssd1306_clear();
+                }
+            } else {
+                // Handoff to UI logic handler
+                handle_ui_update(dcvoltage, dccurrent); 
+            }
+        }
+    }
+    return 0; // Should never be reached
+}

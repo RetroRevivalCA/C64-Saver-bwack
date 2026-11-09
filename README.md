@@ -10,7 +10,24 @@ https://github.com/bwack/
 
 All text above must be included in any redistribution
 
-# Warning: latest version of the savers are not tested.
+# About this fork
+
+This is a modified fork of **bwack's C64 Saver 2**. The hardware design and the original idea are bwack's work and all credit for them goes to him: https://github.com/bwack/C64-Saver-bwack
+
+What this fork adds is new firmware (version 1.00) for the **addon board 1.4**, plus notes on three small part changes (two on the base board, one on the addon board) that it was tested with. It does not change the KiCad design files.
+
+- Firmware: `addon board 1.4/src`. The full list of changes, test results and known limitations is in [`addon board 1.4/src/CHANGES.md`](addon%20board%201.4/src/CHANGES.md).
+- A ready-to-flash `main.hex` is attached to the [v1.00 release](https://github.com/RetroRevivalCA/C64-Saver-bwack/releases/tag/v1.00) (SHA-256 is in CHANGES.md).
+- Hardware changes used and tested with this firmware (through-hole 2.6 base board with addon 1.4): Q1 BC547A replaced with BC547C, R5 3.3k replaced with 100k, and a 1000 uF capacitor added on the addon board. These are described in CHANGES.md and are not in the schematics in this repository.
+
+Please report problems with the firmware in this fork on this repository's issue tracker, not to bwack.
+
+**AI assistance:** The firmware changes in this fork (the refactoring and the new features) were written with AI assistance, with the author directing the work and testing it on real hardware. The code has not had an independent human review, so read it before trusting it with your hardware. The results in the "Test results" section of [CHANGES.md](addon%20board%201.4/src/CHANGES.md) were measured on real hardware (a bench supply, an electronic load, a scope and a real C64), and the protection and recovery logic was also run on a PC with stubbed hardware.
+
+# Testing status
+
+- **Tested in this fork:** addon firmware 1.00 on a through-hole 2.6 base board with addon board 1.4, with the part changes listed above. The results are in [`addon board 1.4/src/CHANGES.md`](addon%20board%201.4/src/CHANGES.md).
+- **Not tested in this fork:** the SMD 2.6 base board, the OCP 0.1 board and the older designs. When bwack published the latest versions of his boards he noted that they were not tested, and that still applies to them. Build them with care and check them before connecting a C64.
 
 # Bwack's C64 saver designs.
 
@@ -69,6 +86,10 @@ Here are the interactive BOMs:
 
 
 # Changelog:
+
+- Addon firmware 1.00, fork (2026-11-08)
+  - New addon firmware, see `addon board 1.4/src/CHANGES.md`.
+  - Tested with the through-hole 2.6 base board and addon board 1.4 with the part changes listed above.
 
 - C64 Saver 2.6 (THT+SMD) and Addon Board 1.4 (2023-04-02)
   - Replaced 7n2002 with BC547/BC847 to fix the tolerance issues.
